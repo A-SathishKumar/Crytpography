@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+substitution_solver.py
+
+Automatic attacker for monoalphabetic substitution ciphers using frequency
+initialization + simulated-annealing / hill-climbing.
+
+Usage:
+    python substitution_solver.py
+It will prompt for ciphertext and optionally the number of candidate plaintexts to show.
+"""
+
+import random
+import math
+import re
+from collections import Counter, defaultdict
+
+# ---------- Config ----------
+ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+ENGLISH_FREQ_ORDER = "ETAOINSHRDLUCMWFGYPBVKJXQZ"
+COMMON_WORDS = ["the","and","that","have","for","not","with","you","this","but","his","from","they","say","her","she","will","one","all","would","there","their","what","so","up","out","if","about"]
+COMMON_TRIGRAMS = ["the","ing","and","ion","ent","her","for","tha","nth","int","ere","tio","ter","ate","ers","his","oft","sth"]
+# A short approximate digram frequency map (higher = more common)
+DIGRAM_SCORE = {
+    "TH": 3.8, "HE":3.3, "IN":2.8, "ER":2.6, "AN":2.5, "RE":2.1, "ED":1.9, "ON":1.8, "ES":1.6, "ST":1.6,
+    "EN":1.6, "AT":1.5, "TO":1.5, "NT":1.3, "HA":1.3, "ET":1.2, "OU":1.2, "EA":1.2, "HI":1.1, "IS":1.1,
+    "OR":1.0, "TI":1.0, "AS":0.9, "TE":0.9, "ET":0.9, "NG":1.1
+}
+
+# ---------- Utilities ----------
+def clean_text(txt):
+    return "".join(ch for ch in txt.upper() if ch.isalpha() or ch.isspace())
+
+def count_common_words(pt):
+    pt_lower = pt.lower()
+    count = 0
+    for w in COMMON_WORDS:
+        # count occurrences as whole words
+        count += len(re.findall(r'\b' + re.escape(w) + r'\b', pt_lower))
+    return count
+
+def count_trigrams(pt):
+    s = re.sub(r'[^A-Z]', '', pt.upper())
+    cnt = 0
+    for tri in COMMON_TRIGRAMS:
+        cnt += s.count(tri.upper())
+    return cnt
+
+def digram_score_plain(pt):
+    s = re.sub(r'[^A-Z]', '', pt.upper())
+    score = 0.0
+    for i in range(len(s)-1):
+        dig = s[i:i+2]
+        score += DIGRAM_SCORE.get(dig, 0.0)
+    return score
+
+def letter_freq_penalty(pt):
+    # encourage English-like letter frequency distribution (light penalty)
+    s = re.sub(r'[^A-Z]', '', pt.upper())
+    if not s:
+        return 0.0
+    cnt = Counter(s)
+    # English expected relative frequencies (approx)
+    expected = {
+        'E': 12.0,'T':9.1,'A':8.2,'O':7.5,'I':7.0,'N':6.7,'S':6.3,'R':6.0,'H':6.1,'L':4.0,
+        'D':4.3,'C':2.8,'U':2.8,'M':2.4,'F':2.2,'Y':2.0,'W':2.4,'G':2.0,'P':1.9,'B':1.5,'V':1.0,'K':0.8,'X':0.2,'Q':0.1,'J':0.15,'Z':0.07
+    }
+    total = len(s)
+    penalty = 0.0
+    for ch, exp in expected.items():
+        obs = (cnt[ch] / total) * 100.0
+        penalty += abs(obs - exp)
+    # normalize
+    return -penalty * 0.02
+
+def score_plaintext(pt):
+    """
+    Composite scoring: common words (strong), trigrams, digrams, letter-freq penalty.
+    """
+    wcount = count_common_words(pt)
+    tri = count_trigrams(pt)
+    dg = digram_score_plain(pt)
+    lf = letter_freq_penalty(pt)
+    # weights tuned heuristically
+    score = (wcount * 25.0) + (tri * 5.0) + (dg * 2.0) + lf
+    return score
+
+# ---------- Substitution helpers ----------
+def make_translation_map(key):
+    """
+    key: 26-letter string giving plaintext letter for ciphertext 'A'..'Z'
+    returns dict mapping ciphertext char -> plaintext char
+    """
+    return {alphabet_char: key[i] for i, alphabet_char in enumerate(ALPHABET)}
+
+def decrypt_with_key(ct, key):
+    mapping = make_translation_map(key)
+    out = []
+    for ch in ct:
+        if ch.isalpha():
+            up = ch.upper()
+            p = mapping[up]
+            out.append(p if ch.isupper() else p.lower())
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def random_key():
+    letters = list(ALPHABET)
+    random.shuffle(letters)
+    return "".join(letters)
+
+def key_from_frequency(ciphertext):
+    """
+    Build an initial key by mapping ciphertext letter freq order to English freq order.
+    """
+    s = re.sub(r'[^A-Z]', '', ciphertext.upper())
+    freq = Counter(s)
+    # letters not present get placed at end randomly
+    letters_by_freq = [p for p, _ in freq.most_common()] + [c for c in ALPHABET if c not in freq]
+    # map ciphertext letter -> plaintext letter (we produce a key string where key[i] is plaintext for ciphertext chr(65+i))
+    mapping = {}
+    for i, c in enumerate(letters_by_freq):
+        if i < len(ENGLISH_FREQ_ORDER):
+            mapping[c] = ENGLISH_FREQ_ORDER[i]
+        else:
+            # remaining map to remaining letters randomly
+            remaining = [ch for ch in ALPHABET if ch not in mapping.values()]
+            mapping[c] = remaining[0] if remaining else 'X'
+    # build key string
+    keylist = []
+    for c in ALPHABET:
+        keylist.append(mapping.get(c, random.choice([x for x in ALPHABET if x not in mapping.values()])))
+    # fill any duplicates by assigning unused letters
+    used = set(keylist)
+    unused = [c for c in ALPHABET if c not in used]
+    for i,ch in enumerate(keylist):
+        if keylist.count(ch) > 1:
+            keylist[i] = unused.pop() if unused else ch
+    return "".join(keylist)
+
+# ---------- Hill-climbing / Simulated annealing ----------
+def neighbor_key_swap(key):
+    lst = list(key)
+    i, j = random.sample(range(26), 2)
+    lst[i], lst[j] = lst[j], lst[i]
+    return "".join(lst)
+
+def improve_key(ciphertext, initial_key, max_iters=2000, temp_start=5.0, temp_end=0.1):
+    """
+    Simulated annealing hill-climb starting from initial_key.
+    Returns best_key, best_score
+    """
+    ct = ciphertext
+    best_key = initial_key
+    best_plain = decrypt_with_key(ct, best_key)
+    best_score = score_plaintext(best_plain)
+
+    current_key = best_key
+    current_score = best_score
+
+    for i in range(max_iters):
+        # temperature schedule
+        t = temp_start * ((temp_end / temp_start) ** (i / max(1, max_iters-1)))
+        # propose neighbor
+        candidate_key = neighbor_key_swap(current_key)
+        candidate_plain = decrypt_with_key(ct, candidate_key)
+        candidate_score = score_plaintext(candidate_plain)
+        delta = candidate_score - current_score
+        # accept if better or with small probability (annealing)
+        if delta > 0 or random.random() < math.exp(delta / (t + 1e-9)):
+            current_key = candidate_key
+            current_score = candidate_score
+            if current_score > best_score:
+                best_key = current_key
+                best_score = current_score
+    return best_key, best_score
+
+def solve_substitution(ciphertext, top_k=5, restarts=20, max_iters=3000):
+    """
+    Try multiple restarts. Return list of (score, plaintext, key) sorted descending.
+    """
+    ciphertext = ciphertext
+    candidates = []
+    # initial candidate from frequency map
+    freq_key = key_from_frequency(ciphertext)
+    k, s = improve_key(ciphertext, freq_key, max_iters=max_iters)
+    candidates.append((s, decrypt_with_key(ciphertext, k), k))
+
+    # additional random restarts around freq_key and random keys
+    for r in range(restarts-1):
+        if r % 2 == 0:
+            init = random_key()
+        else:
+            # small randomization around freq_key
+            lk = list(freq_key)
+            for _ in range(random.randint(1,8)):
+                i,j = random.sample(range(26),2)
+                lk[i], lk[j] = lk[j], lk[i]
+            init = "".join(lk)
+        k, s = improve_key(ciphertext, init, max_iters=max_iters)
+        candidates.append((s, decrypt_with_key(ciphertext, k), k))
+
+    # deduplicate by plaintext
+    uniq = {}
+    for sc, pt, k in candidates:
+        if pt not in uniq or sc > uniq[pt][0]:
+            uniq[pt] = (sc, k)
+    result = sorted([(sc, pt, k) for pt,(sc,k) in uniq.items()], key=lambda x: -x[0])
+    return result[:top_k]
+
+# ---------- CLI ----------
+def interactive():
+    print("Monoalphabetic substitution cipher automatic solver")
+    print("Paste ciphertext (end with blank line):")
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if line.strip() == "":
+            break
+        lines.append(line)
+    ciphertext = "\n".join(lines)
+    if not ciphertext.strip():
+        print("No input provided. Exiting.")
+        return
+    try:
+        topk = int(input("How many candidate plaintexts to show? [default 5]: ") or "5")
+    except Exception:
+        topk = 5
+    print("\nSolving... (this may take several seconds depending on text length)")
+    results = solve_substitution(ciphertext, top_k=topk, restarts=30, max_iters=5000)
+    print("\nTop candidates (score descending):\n")
+    for rank, (score, plaintext, key) in enumerate(results, start=1):
+        print(f"==== Candidate #{rank}  (score={score:.2f}) ====")
+        print("Key (cipher->plain):")
+        print("".join(f"{ALPHABET[i]}->{key[i]} " for i in range(26)))
+        print("\nPlaintext preview:")
+        print(plaintext)
+        print("\n")
+
+if __name__ == "__main__":
+    interactive()
